@@ -140,6 +140,7 @@ volatile _Bool unbalance_flag = 0;
 int32_t wash_pi_i_left = 0;
 int32_t wash_pi_i_right = 0;
 int32_t spin_pi_i = 0;
+uint8_t spin_e51_arm_s = 0;
 
 /* USER CODE END PV */
 
@@ -221,6 +222,11 @@ void check_E(void);
 #define SPIN_PI_KI_DIV 128
 #define SPIN_PI_I_CLAMP 4096
 #define SPIN_PI_MAX_STEP 4
+#define WASH_PI_START_MAX_STEP 6
+#define SPIN_PI_START_MAX_STEP 8
+#define PI_STARTUP_PULSES_250MS 6U /* ~>=10rpm (depends on tacho PPR); used as "motion established" threshold */
+
+#define SPIN_E51_ARM_DELAY_S 5U
 
 #define MOTOR_SPEED_MIN 50U
 #define MOTOR_SPEED_MAX 2000U
@@ -1912,7 +1918,8 @@ void onems_func()
 						{
 							int32_t target = 4 * (int32_t)spinspeed;
 							int32_t err = target - (int32_t)taco_cnt2;
-							int16_t delta = pi_step(&spin_pi_i, err, SPIN_PI_KP_DIV, SPIN_PI_KI_DIV, SPIN_PI_I_CLAMP, SPIN_PI_MAX_STEP);
+							int16_t max_step = (taco_cnt2 < PI_STARTUP_PULSES_250MS) ? SPIN_PI_START_MAX_STEP : SPIN_PI_MAX_STEP;
+							int16_t delta = pi_step(&spin_pi_i, err, SPIN_PI_KP_DIV, SPIN_PI_KI_DIV, SPIN_PI_I_CLAMP, max_step);
 
 							if (unbalance_flag)
 							{
@@ -2489,12 +2496,25 @@ void ms1000_func()
 			/* Dry/spin: less sensitive, longer timeout. */
 			tacho_monitor_active = base_drive_active && (spinspeed > 0);
 			tacho_timeout_s = SPIN_TACHO_TIMEOUT_S;
+			if (tacho_monitor_active)
+			{
+				/* Arm E51 a few seconds after spin starts, or immediately after first tacho pulse. */
+				if (last_tacho_time_5us != 0)
+					spin_e51_arm_s = SPIN_E51_ARM_DELAY_S;
+				else if (spin_e51_arm_s < SPIN_E51_ARM_DELAY_S)
+					spin_e51_arm_s++;
+			}
+			else
+			{
+				spin_e51_arm_s = 0;
+			}
 		}
 		else
 		{
 			/* Wash + rinse agitation: direction must be selected. */
 			tacho_monitor_active = base_drive_active && washst_flag && (left_flag || right_flag);
 			tacho_timeout_s = WASH_RINSE_TACHO_TIMEOUT_S;
+			spin_e51_arm_s = 0;
 		}
 
 		if (washst_flag)
@@ -2503,22 +2523,14 @@ void ms1000_func()
 		mission_flag = 1;
 
 		/* Raise E51 if tacho feedback is missing while motor drive is active. */
-		if (tacho_monitor_active)
+		if (tacho_monitor_active && (!spin_mode || (spin_e51_arm_s >= SPIN_E51_ARM_DELAY_S)))
 		{
-			if (turn_motor)
-			{
-				turn_motor = 0;
-				taco_stop_tmr = 0;
-				E51_cnt = 0;
-			}
-			else
-			{
-				if (taco_stop_tmr < 255)
-					taco_stop_tmr++;
-				E51_cnt = taco_stop_tmr;
-				if (taco_stop_tmr >= tacho_timeout_s)
-					E51_flag = 1;
-			}
+			/* taco_stop_tmr is reset in tacho ISR; count seconds since last pulse. */
+			if (taco_stop_tmr < 255)
+				taco_stop_tmr++;
+			E51_cnt = taco_stop_tmr;
+			if (taco_stop_tmr >= tacho_timeout_s)
+				E51_flag = 1;
 		}
 		else
 		{
@@ -3641,7 +3653,8 @@ void spchg_func()
 	{
 		uint16_t target = (uint16_t)((maxtaco + mintaco) / 2);
 		int32_t err = (int32_t)target - (int32_t)taco_cnt;
-		int16_t delta = pi_step(&wash_pi_i_left, err, WASH_PI_KP_DIV, WASH_PI_KI_DIV, WASH_PI_I_CLAMP, WASH_PI_MAX_STEP);
+		int16_t max_step = (taco_cnt < PI_STARTUP_PULSES_250MS) ? WASH_PI_START_MAX_STEP : WASH_PI_MAX_STEP;
+		int16_t delta = pi_step(&wash_pi_i_left, err, WASH_PI_KP_DIV, WASH_PI_KI_DIV, WASH_PI_I_CLAMP, max_step);
 		int32_t next = (int32_t)motor_speed_slctL + (int32_t)delta;
 		if (next < (int32_t)MOTOR_SPEED_MIN)
 			next = MOTOR_SPEED_MIN;
@@ -3664,7 +3677,8 @@ void spchg_func()
 	{
 		uint16_t target = (uint16_t)((maxtaco + mintaco) / 2);
 		int32_t err = (int32_t)target - (int32_t)taco_cnt;
-		int16_t delta = pi_step(&wash_pi_i_right, err, WASH_PI_KP_DIV, WASH_PI_KI_DIV, WASH_PI_I_CLAMP, WASH_PI_MAX_STEP);
+		int16_t max_step = (taco_cnt < PI_STARTUP_PULSES_250MS) ? WASH_PI_START_MAX_STEP : WASH_PI_MAX_STEP;
+		int16_t delta = pi_step(&wash_pi_i_right, err, WASH_PI_KP_DIV, WASH_PI_KI_DIV, WASH_PI_I_CLAMP, max_step);
 		int32_t next = (int32_t)motor_speed_slctR + (int32_t)delta;
 		if (next < (int32_t)MOTOR_SPEED_MIN)
 			next = MOTOR_SPEED_MIN;
