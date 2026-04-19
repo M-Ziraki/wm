@@ -120,6 +120,27 @@ uint16_t motor_relay_timer_ms = 0;
 _Bool master_relay_target = 0, master_relay_on = 0, master_relay_off_pending = 0;
 uint16_t master_relay_timer_ms = 0;
 
+/* Free-running timebase derived from TIM3 update interrupt (5us per tick). */
+volatile uint32_t timebase_5us_ticks = 0;
+volatile uint32_t last_tacho_time_5us = 0;
+
+/* Spin unbalance metric state (computed from tachometer dt jitter). */
+volatile uint16_t unb_dt_min = 0;
+volatile uint16_t unb_dt_max = 0;
+volatile uint32_t unb_dt_sum = 0;
+volatile uint8_t unb_dt_count = 0;
+volatile uint32_t unb_min_sum = 0;
+volatile uint32_t unb_max_sum = 0;
+volatile uint32_t unb_mean_sum = 0;
+volatile uint8_t unb_win_count = 0;
+volatile uint16_t unb_ripple_q10 = 0;
+volatile _Bool unbalance_flag = 0;
+
+/* PI integrators (error units: tacho pulses per 250ms). */
+int32_t wash_pi_i_left = 0;
+int32_t wash_pi_i_right = 0;
+int32_t spin_pi_i = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -138,6 +159,9 @@ static void motor_relay_service_1ms(void);
 static void master_relay_force_reset(void);
 static void master_relay_request(_Bool on);
 static void master_relay_service_1ms(void);
+
+static void unbalance_reset(void);
+static int16_t pi_step(int32_t *integrator, int32_t err, int32_t kp_div, int32_t ki_div, int32_t i_clamp, int16_t max_step);
 
 /* USER CODE END PFP */
 
@@ -178,6 +202,28 @@ void check_E(void);
 #define SPIN_TACHO_TIMEOUT_S 20U
 #define IS_MOTOR_DRIVE_ACTIVE_BASE() (run_motor && allow_relay && doorlock_flag && \
 									  (motor_relay_applied != MOTOR_RELAY_CMD_OFF))
+
+/* Spin unbalance detection using tachometer pulse-to-pulse jitter. */
+#define UNB_SPINSPEED_MIN 100U /* enable unbalance metric above this spin target */
+#define UNB_WINDOW_INTERVALS 16U
+#define UNB_WINDOWS 10U
+#define UNB_RIPPLE_Q10_THRESHOLD 205U /* ~0.20 in Q10: (max-min)/mean */
+#define UNB_TACHO_DT_MIN_TICKS 50U    /* 50 * 5us = 250us */
+#define UNB_TACHO_DT_MAX_TICKS 60000U /* 60000 * 5us = 300ms */
+
+/* Speed PI controller (tachometer-based). */
+#define WASH_PI_KP_DIV 8
+#define WASH_PI_KI_DIV 64
+#define WASH_PI_I_CLAMP 2048
+#define WASH_PI_MAX_STEP 3
+
+#define SPIN_PI_KP_DIV 8
+#define SPIN_PI_KI_DIV 128
+#define SPIN_PI_I_CLAMP 4096
+#define SPIN_PI_MAX_STEP 4
+
+#define MOTOR_SPEED_MIN 50U
+#define MOTOR_SPEED_MAX 2000U
 
 static void motor_relay_apply_hw(MotorRelayCommand cmd)
 {
@@ -391,6 +437,49 @@ static void motor_relay_service_1ms(void)
 			allow_relay = (motor_relay_applied != MOTOR_RELAY_CMD_OFF);
 		break;
 	}
+}
+
+static void unbalance_reset(void)
+{
+	unb_dt_min = 0;
+	unb_dt_max = 0;
+	unb_dt_sum = 0;
+	unb_dt_count = 0;
+	unb_min_sum = 0;
+	unb_max_sum = 0;
+	unb_mean_sum = 0;
+	unb_win_count = 0;
+	unb_ripple_q10 = 0;
+	unbalance_flag = 0;
+	last_tacho_time_5us = 0;
+}
+
+static int16_t pi_step(int32_t *integrator, int32_t err, int32_t kp_div, int32_t ki_div, int32_t i_clamp, int16_t max_step)
+{
+	int32_t i_next = *integrator + err;
+	if (i_next > i_clamp)
+		i_next = i_clamp;
+	else if (i_next < -i_clamp)
+		i_next = -i_clamp;
+
+	int32_t out = (kp_div != 0) ? (err / kp_div) : 0;
+	out += (ki_div != 0) ? (i_next / ki_div) : 0;
+
+	if (out > max_step)
+	{
+		out = max_step;
+		if (err > 0)
+			i_next = *integrator; /* anti-windup */
+	}
+	else if (out < -max_step)
+	{
+		out = -max_step;
+		if (err < 0)
+			i_next = *integrator; /* anti-windup */
+	}
+
+	*integrator = i_next;
+	return (int16_t)out;
 }
 
 /* USER CODE END 0 */
@@ -1810,30 +1899,53 @@ void onems_func()
 	}
 	if (run_flag)
 	{
-		if (spin_mode)
-		{
-			tcpl++;
-			if (tcpl > 249)
+			if (spin_mode)
 			{
-				tcpl = 0;
-				taco_cnt2 = taco_cnt;
-				taco_cnt = 0;
-			}
-			y++; // mrc
-			if (spinspeed > plm * 2)
-				y++; // mrc
-			if ((mission_timer > 140) && (!sosp_flag))
-				y += 2;
-			if (y > 100) // mrc
-			{
-				if ((allow_relay) && (taco_cnt2 < 4 * spinspeed) && (run_motor) && (motor_speed < 2000)) //  150 -> 400rpm   300 -> 800rpm   450 -> 1200rpm
-				{
-					motor_speed++;
+				tcpl++;
+					if (tcpl > 249)
+					{
+						tcpl = 0;
+						taco_cnt2 = taco_cnt;
+						taco_cnt = 0;
+
+						if (allow_relay && run_motor && (motor_speed < MOTOR_SPEED_MAX) && (spinspeed > 0))
+						{
+							int32_t target = 4 * (int32_t)spinspeed;
+							int32_t err = target - (int32_t)taco_cnt2;
+							int16_t delta = pi_step(&spin_pi_i, err, SPIN_PI_KP_DIV, SPIN_PI_KI_DIV, SPIN_PI_I_CLAMP, SPIN_PI_MAX_STEP);
+
+							if (unbalance_flag)
+							{
+								if (delta > 0)
+									delta = 0;
+								if (motor_speed > motor_speed_start)
+									motor_speed--;
+							}
+
+							int32_t next = (int32_t)motor_speed + (int32_t)delta;
+							if (next < (int32_t)motor_speed_start)
+								next = (int32_t)motor_speed_start;
+							if (next > (int32_t)MOTOR_SPEED_MAX)
+								next = (int32_t)MOTOR_SPEED_MAX;
+							motor_speed = (uint16_t)next;
+						}
+						else
+						{
+							spin_pi_i = 0;
+						}
+					}
+					y++; // mrc
+					if (spinspeed > plm * 2)
+						y++; // mrc
+				if ((mission_timer > 140) && (!sosp_flag))
+					y += 2;
+					if (y > 100) // mrc
+					{
+						/* Speed is controlled by PI on 250ms updates above. Keep this loop passive. */
+						y = 0;
+					}
 				}
-				y = 0;
-			}
-		}
-		else
+			else
 		{
 			if (first_turn_motor)
 			{
@@ -3527,18 +3639,15 @@ void spchg_func()
 {
 	if ((allow_relay) && (left_flag) && (run_motor) && (!spin_mode)) //////turn_motor?????
 	{
-		if ((program_select != 7) && (taco_cnt > maxtaco + 12))
-			motor_speed_slctL -= 1;
-		if ((program_select != 7) && (taco_cnt > maxtaco + 4))
-			motor_speed_slctL -= 4;
-		if (taco_cnt > maxtaco)
-			motor_speed_slctL -= 1;
-		if ((program_select != 7) && (taco_cnt + 10 < mintaco) && (cc > 2) && (cc < 7))
-			motor_speed_slctL += 2;
-		if (taco_cnt < mintaco)
-		{
-			motor_speed_slctL += 1; // incr motor speed  vvvv
-		}
+		uint16_t target = (uint16_t)((maxtaco + mintaco) / 2);
+		int32_t err = (int32_t)target - (int32_t)taco_cnt;
+		int16_t delta = pi_step(&wash_pi_i_left, err, WASH_PI_KP_DIV, WASH_PI_KI_DIV, WASH_PI_I_CLAMP, WASH_PI_MAX_STEP);
+		int32_t next = (int32_t)motor_speed_slctL + (int32_t)delta;
+		if (next < (int32_t)MOTOR_SPEED_MIN)
+			next = MOTOR_SPEED_MIN;
+		if (next > (int32_t)MOTOR_SPEED_MAX)
+			next = MOTOR_SPEED_MAX;
+		motor_speed_slctL = (uint16_t)next;
 		if ((taco_cnt <= maxtaco) && (taco_cnt >= mintaco))
 		{
 			if (grab_cnt < 10)
@@ -3549,24 +3658,19 @@ void spchg_func()
 				motor_speed_slctR = motor_speed_slctL - 10;
 			}
 		}
-		if (motor_speed_slctL < 50)
-			motor_speed_slctL = 50;
 		taco_cnt = 0;
 	}
 	if ((allow_relay) && (right_flag) && (run_motor) && (!spin_mode))
 	{
-		if ((program_select != 7) && (taco_cnt > maxtaco + 12))
-			motor_speed_slctR -= 1;
-		if ((program_select != 7) && (taco_cnt > maxtaco + 4))
-			motor_speed_slctR -= 1;
-		if (taco_cnt > maxtaco)
-			motor_speed_slctR -= 1;
-		if ((program_select != 7) && (taco_cnt + 10 < mintaco) && (cc > 2) && (cc < 7))
-			motor_speed_slctR += 2;
-		if (taco_cnt < mintaco)
-		{
-			motor_speed_slctR += 1; // incr motor speed  vvvv
-		}
+		uint16_t target = (uint16_t)((maxtaco + mintaco) / 2);
+		int32_t err = (int32_t)target - (int32_t)taco_cnt;
+		int16_t delta = pi_step(&wash_pi_i_right, err, WASH_PI_KP_DIV, WASH_PI_KI_DIV, WASH_PI_I_CLAMP, WASH_PI_MAX_STEP);
+		int32_t next = (int32_t)motor_speed_slctR + (int32_t)delta;
+		if (next < (int32_t)MOTOR_SPEED_MIN)
+			next = MOTOR_SPEED_MIN;
+		if (next > (int32_t)MOTOR_SPEED_MAX)
+			next = MOTOR_SPEED_MAX;
+		motor_speed_slctR = (uint16_t)next;
 		if ((taco_cnt <= maxtaco) && (taco_cnt >= mintaco))
 		{
 			if (grab_cnt < 10)
@@ -3577,8 +3681,6 @@ void spchg_func()
 				motor_speed_slctL = motor_speed_slctR - 10;
 			}
 		}
-		if (motor_speed_slctR < 50)
-			motor_speed_slctR = 50;
 		taco_cnt = 0;
 	}
 	spchg_flag = 0;
@@ -6857,6 +6959,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 	/* USER CODE BEGIN Callback 1 */
 	if (htim->Instance == TIM3) //	5us
 	{
+		timebase_5us_ticks++;
 		if (trig_flag)
 			x++;
 		if (trig_flag2)
@@ -6930,6 +7033,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 	}
 	if (GPIO_Pin == Taco_PLS_Pin)
 	{
+		uint32_t now_5us = timebase_5us_ticks;
+		uint32_t dt_5us = 0;
+		if (last_tacho_time_5us != 0)
+			dt_5us = now_5us - last_tacho_time_5us;
+		last_tacho_time_5us = now_5us;
+
 		turn_motor = 1;
 		taco_stop_tmr = 0;
 		E51_cnt = 0;
@@ -6950,6 +7059,66 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 		if (tc > 3)
 		{
 			taco_stop_tmr = 0;
+
+			/* Spin unbalance metric: compute dt jitter over windows of 16 intervals, repeated 10 times. */
+			if (spin_mode && (spinspeed > UNB_SPINSPEED_MIN) &&
+				(dt_5us >= UNB_TACHO_DT_MIN_TICKS) && (dt_5us <= UNB_TACHO_DT_MAX_TICKS))
+			{
+				uint16_t dt16 = (dt_5us > 0xFFFFu) ? 0xFFFFu : (uint16_t)dt_5us;
+				if (unb_dt_count == 0)
+				{
+					unb_dt_min = dt16;
+					unb_dt_max = dt16;
+					unb_dt_sum = dt16;
+					unb_dt_count = 1;
+				}
+				else
+				{
+					if (dt16 < unb_dt_min)
+						unb_dt_min = dt16;
+					if (dt16 > unb_dt_max)
+						unb_dt_max = dt16;
+					unb_dt_sum += dt16;
+					unb_dt_count++;
+				}
+
+				if (unb_dt_count >= UNB_WINDOW_INTERVALS)
+				{
+					uint32_t mean_dt = unb_dt_sum / UNB_WINDOW_INTERVALS;
+					unb_min_sum += unb_dt_min;
+					unb_max_sum += unb_dt_max;
+					unb_mean_sum += mean_dt;
+					unb_win_count++;
+
+					unb_dt_min = 0;
+					unb_dt_max = 0;
+					unb_dt_sum = 0;
+					unb_dt_count = 0;
+
+					if (unb_win_count >= UNB_WINDOWS)
+					{
+						uint32_t avg_min = unb_min_sum / UNB_WINDOWS;
+						uint32_t avg_max = unb_max_sum / UNB_WINDOWS;
+						uint32_t avg_mean = unb_mean_sum / UNB_WINDOWS;
+						if (avg_mean > 0 && avg_max >= avg_min)
+						{
+							uint32_t ripple_q10 = ((avg_max - avg_min) * 1024u) / avg_mean;
+							unb_ripple_q10 = (ripple_q10 > 0xFFFFu) ? 0xFFFFu : (uint16_t)ripple_q10;
+							unbalance_flag = (unb_ripple_q10 >= UNB_RIPPLE_Q10_THRESHOLD);
+						}
+						unb_min_sum = 0;
+						unb_max_sum = 0;
+						unb_mean_sum = 0;
+						unb_win_count = 0;
+					}
+				}
+			}
+			else if (!spin_mode)
+			{
+				/* Clear spin-only metric when leaving spin mode. */
+				unbalance_reset();
+			}
+
 			if (!first_turn_motor)
 			{
 				motor_speed_slctL = motor_speed;
