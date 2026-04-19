@@ -1,0 +1,18 @@
+# Keil MDK-ARM user-specific files
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.uvoptx
+MDK-ARM/*.bak
+MDK-ARM/*.tmp
+
+# Keil build outputs
+MDK-ARM/WMc8t6/
+MDK-ARM/*.axf
+MDK-ARM/*.bin
+MDK-ARM/*.crf
+MDK-ARM/*.d
+MDK-ARM/*.dep
+MDK-ARM/*.hex
+MDK-ARM/*.htm
+MDK-ARM/*.lst
+MDK-ARM/*.map
+MDK-ARM/*.o
