@@ -22,7 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "socketDma.h"
+#include "SocketDma.h"
 #include "stm32f1xx_it.h"
 #include "stdio.h"
 #include "math.h"
@@ -6874,7 +6874,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 			nr3++;
 			if (nr3 > 1)
 			{
-				if ((nrcnt < 9) && (nrcnt > 11))
+				// Reset when nrcnt is outside the valid [9,11] window.
+				if ((nrcnt < 9) || (nrcnt > 11))
 					nr3 = 0;
 			}
 		}
