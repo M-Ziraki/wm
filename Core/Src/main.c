@@ -174,8 +174,9 @@ void check_E(void);
 #define MOTOR_RELAY_HOLD_OFF_MS 2000U
 #define MOTOR_RELAY_DEADTIME_MS 100U
 #define MOTOR_RELAY_SETTLE_MS 100U
-#define WASH_TACHO_TIMEOUT_S 5U
-#define IS_WASH_TACHO_MONITOR_ACTIVE() (washst_flag && run_motor && allow_relay && doorlock_flag && \
+#define WASH_TACHO_TIMEOUT_S 8U
+#define IS_WASH_TACHO_MONITOR_ACTIVE() (washst_flag && !spin_mode && (left_flag || right_flag) && \
+										run_motor && allow_relay && doorlock_flag && \
 										(motor_relay_applied != MOTOR_RELAY_CMD_OFF))
 
 static void motor_relay_apply_hw(MotorRelayCommand cmd)
