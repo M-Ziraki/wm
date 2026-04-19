@@ -174,10 +174,10 @@ void check_E(void);
 #define MOTOR_RELAY_HOLD_OFF_MS 2000U
 #define MOTOR_RELAY_DEADTIME_MS 100U
 #define MOTOR_RELAY_SETTLE_MS 100U
-#define WASH_TACHO_TIMEOUT_S 8U
-#define IS_WASH_TACHO_MONITOR_ACTIVE() (washst_flag && !spin_mode && (left_flag || right_flag) && \
-										run_motor && allow_relay && doorlock_flag && \
-										(motor_relay_applied != MOTOR_RELAY_CMD_OFF))
+#define WASH_RINSE_TACHO_TIMEOUT_S 8U
+#define SPIN_TACHO_TIMEOUT_S 20U
+#define IS_MOTOR_DRIVE_ACTIVE_BASE() (run_motor && allow_relay && doorlock_flag && \
+									  (motor_relay_applied != MOTOR_RELAY_CMD_OFF))
 
 static void motor_relay_apply_hw(MotorRelayCommand cmd)
 {
@@ -2368,15 +2368,30 @@ void ms1000_func()
 	}
 	if (run_flag)
 	{
-		_Bool wash_tacho_monitor_active = IS_WASH_TACHO_MONITOR_ACTIVE();
+		_Bool base_drive_active = IS_MOTOR_DRIVE_ACTIVE_BASE();
+		_Bool tacho_monitor_active = 0;
+		uint8_t tacho_timeout_s = 0;
+
+		if (spin_mode)
+		{
+			/* Dry/spin: less sensitive, longer timeout. */
+			tacho_monitor_active = base_drive_active && (spinspeed > 0);
+			tacho_timeout_s = SPIN_TACHO_TIMEOUT_S;
+		}
+		else
+		{
+			/* Wash + rinse agitation: direction must be selected. */
+			tacho_monitor_active = base_drive_active && washst_flag && (left_flag || right_flag);
+			tacho_timeout_s = WASH_RINSE_TACHO_TIMEOUT_S;
+		}
 
 		if (washst_flag)
 			washing_cnt++;
 		mission_timer++;
 		mission_flag = 1;
 
-		/* In wash stage, raise E51 if tacho feedback is missing for 5 seconds while motor drive is active. */
-		if (wash_tacho_monitor_active)
+		/* Raise E51 if tacho feedback is missing while motor drive is active. */
+		if (tacho_monitor_active)
 		{
 			if (turn_motor)
 			{
@@ -2389,7 +2404,7 @@ void ms1000_func()
 				if (taco_stop_tmr < 255)
 					taco_stop_tmr++;
 				E51_cnt = taco_stop_tmr;
-				if (taco_stop_tmr >= WASH_TACHO_TIMEOUT_S)
+				if (taco_stop_tmr >= tacho_timeout_s)
 					E51_flag = 1;
 			}
 		}
