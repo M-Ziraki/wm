@@ -174,6 +174,9 @@ void check_E(void);
 #define MOTOR_RELAY_HOLD_OFF_MS 2000U
 #define MOTOR_RELAY_DEADTIME_MS 100U
 #define MOTOR_RELAY_SETTLE_MS 100U
+#define WASH_TACHO_TIMEOUT_S 5U
+#define IS_WASH_TACHO_MONITOR_ACTIVE() (washst_flag && run_motor && allow_relay && doorlock_flag && \
+										(motor_relay_applied != MOTOR_RELAY_CMD_OFF))
 
 static void motor_relay_apply_hw(MotorRelayCommand cmd)
 {
@@ -2364,8 +2367,7 @@ void ms1000_func()
 	}
 	if (run_flag)
 	{
-		_Bool wash_drive_active = washst_flag && run_motor && allow_relay && doorlock_flag &&
-								  (motor_relay_applied != MOTOR_RELAY_CMD_OFF);
+		_Bool wash_tacho_monitor_active = IS_WASH_TACHO_MONITOR_ACTIVE();
 
 		if (washst_flag)
 			washing_cnt++;
@@ -2373,7 +2375,7 @@ void ms1000_func()
 		mission_flag = 1;
 
 		/* In wash stage, raise E51 if tacho feedback is missing for 5 seconds while motor drive is active. */
-		if (wash_drive_active)
+		if (wash_tacho_monitor_active)
 		{
 			if (turn_motor)
 			{
@@ -2386,7 +2388,7 @@ void ms1000_func()
 				if (taco_stop_tmr < 255)
 					taco_stop_tmr++;
 				E51_cnt = taco_stop_tmr;
-				if (taco_stop_tmr >= 5)
+				if (taco_stop_tmr >= WASH_TACHO_TIMEOUT_S)
 					E51_flag = 1;
 			}
 		}
