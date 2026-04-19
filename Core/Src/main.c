@@ -200,7 +200,8 @@ void check_E(void);
 #define MOTOR_RELAY_DEADTIME_MS 100U
 #define MOTOR_RELAY_SETTLE_MS 100U
 #define WASH_RINSE_TACHO_TIMEOUT_S 8U
-#define SPIN_TACHO_TIMEOUT_S 20U
+#define SPIN_TACHO_TIMEOUT_LOW_S 20U
+#define SPIN_TACHO_TIMEOUT_HIGH_S 7U /* high-speed spin: < 8s as requested */
 #define IS_MOTOR_DRIVE_ACTIVE_BASE() (run_motor && allow_relay && doorlock_flag && \
 									  (motor_relay_applied != MOTOR_RELAY_CMD_OFF))
 
@@ -2491,16 +2492,20 @@ void ms1000_func()
 		_Bool tacho_monitor_active = 0;
 		uint8_t tacho_timeout_s = 0;
 
-		if (spin_mode)
-		{
-			/* Dry/spin: less sensitive, longer timeout. */
-			tacho_monitor_active = base_drive_active && (spinspeed > 0);
-			tacho_timeout_s = SPIN_TACHO_TIMEOUT_S;
-			if (tacho_monitor_active)
+			if (spin_mode)
 			{
-				/* Arm E51 a few seconds after spin starts, or immediately after first tacho pulse. */
-				if (last_tacho_time_5us != 0)
-					spin_e51_arm_s = SPIN_E51_ARM_DELAY_S;
+				/* Dry/spin: less sensitive, longer timeout. */
+				tacho_monitor_active = base_drive_active && (spinspeed > 0);
+				/* At higher spin targets, fail faster on missing tacho feedback. */
+				if (spinspeed >= (plm * 3))
+					tacho_timeout_s = SPIN_TACHO_TIMEOUT_HIGH_S;
+				else
+					tacho_timeout_s = SPIN_TACHO_TIMEOUT_LOW_S;
+				if (tacho_monitor_active)
+				{
+					/* Arm E51 a few seconds after spin starts, or immediately after first tacho pulse. */
+					if (last_tacho_time_5us != 0)
+						spin_e51_arm_s = SPIN_E51_ARM_DELAY_S;
 				else if (spin_e51_arm_s < SPIN_E51_ARM_DELAY_S)
 					spin_e51_arm_s++;
 			}
@@ -2509,13 +2514,19 @@ void ms1000_func()
 				spin_e51_arm_s = 0;
 			}
 		}
-		else
-		{
-			/* Wash + rinse agitation: direction must be selected. */
-			tacho_monitor_active = base_drive_active && washst_flag && (left_flag || right_flag);
-			tacho_timeout_s = WASH_RINSE_TACHO_TIMEOUT_S;
-			spin_e51_arm_s = 0;
-		}
+			else
+			{
+				/*
+				 * Wash + rinse agitation: direction must be selected.
+				 * NOTE: In program_select==7 (spin program) the firmware briefly runs a low-speed
+				 * left/right redistribution phase with spin_mode==0. That phase can legitimately
+				 * have sparse/no tacho pulses, so E51 monitoring must be disabled there to avoid
+				 * false errors between the initial spin and the main spin ramp.
+				 */
+				tacho_monitor_active = base_drive_active && washst_flag && (left_flag || right_flag) && (program_select != 7);
+				tacho_timeout_s = WASH_RINSE_TACHO_TIMEOUT_S;
+				spin_e51_arm_s = 0;
+			}
 
 		if (washst_flag)
 			washing_cnt++;
