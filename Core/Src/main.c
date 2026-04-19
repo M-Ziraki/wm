@@ -2364,31 +2364,37 @@ void ms1000_func()
 	}
 	if (run_flag)
 	{
+		_Bool wash_drive_active = washst_flag && run_motor && allow_relay && doorlock_flag &&
+								  (motor_relay_applied != MOTOR_RELAY_CMD_OFF);
+
 		if (washst_flag)
 			washing_cnt++;
 		mission_timer++;
 		mission_flag = 1;
-		if ((motor_speed - motor_speed_start > 400) && (motor_speed > motor_speed_start) && (!turn_motor) && (E5lchk_flag) && (doorlock_flag))
+
+		/* In wash stage, raise E51 if tacho feedback is missing for 5 seconds while motor drive is active. */
+		if (wash_drive_active)
 		{
-			E51_cnt++;
-			if (E51_cnt > 4)
+			if (turn_motor)
 			{
-				if ((mission_timer > 166) && (program_select == 7))
-				{
-					mission_timer = 420;
-					E51_cnt = 0;
-				}
-				else
-				{
+				turn_motor = 0;
+				taco_stop_tmr = 0;
+				E51_cnt = 0;
+			}
+			else
+			{
+				if (taco_stop_tmr < 255)
+					taco_stop_tmr++;
+				E51_cnt = taco_stop_tmr;
+				if (taco_stop_tmr >= 5)
 					E51_flag = 1;
-				}
 			}
 		}
 		else
 		{
 			turn_motor = 0;
+			taco_stop_tmr = 0;
 			E51_cnt = 0;
-			E5lchk_flag = 0;
 		}
 		if (washing_cnt > washturntime * 2 + washresttime * 2 - 1)
 		{
@@ -6907,6 +6913,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 	if (GPIO_Pin == Taco_PLS_Pin)
 	{
 		turn_motor = 1;
+		taco_stop_tmr = 0;
+		E51_cnt = 0;
 		tacosafe++;
 		if ((tacosafe > 50) && (washst_flag))
 		{
